@@ -4,6 +4,8 @@ import {
   UnauthorizedException,
   BadRequestException,
   NotFoundException,
+  ForbiddenException,
+  Inject,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
@@ -12,12 +14,15 @@ import * as crypto from 'crypto';
 import { UsersService } from '../users/users.service';
 import { UsersRepository } from '../users/users.repository';
 import { EmailService } from '../email/email.service';
+import { IAuthProvider } from './providers/auth-provider.interface';
 import { RegisterDto } from './dto/register.dto';
 import { LoginDto } from './dto/login.dto';
 import { RefreshTokenDto } from './dto/refresh-token.dto';
 import { ChangePasswordDto } from './dto/change-password.dto';
 import { VerifyEmailDto } from './dto/verify-email.dto';
 import { ResendVerificationDto } from './dto/resend-verification.dto';
+
+export const AUTH_PROVIDERS = 'AUTH_PROVIDERS';
 
 @Injectable()
 export class AuthService {
@@ -27,9 +32,14 @@ export class AuthService {
     private readonly jwtService: JwtService,
     private readonly configService: ConfigService,
     private readonly emailService: EmailService,
+    @Inject(AUTH_PROVIDERS) private readonly authProviders: IAuthProvider[],
   ) {}
 
   async register(registerDto: RegisterDto) {
+    if (this.configService.get<string>('AD_ENABLED') === 'true') {
+      throw new ForbiddenException('Registration is disabled when AD is enabled');
+    }
+
     const { email, password, name } = registerDto;
 
     // Check if user already exists
@@ -86,34 +96,25 @@ export class AuthService {
   async login(loginDto: LoginDto) {
     const { email, password } = loginDto;
 
-    // Find user with password
-    const user = await this.usersService.findByEmailWithPassword(email);
-    if (!user) {
-      throw new UnauthorizedException('Invalid credentials');
+    for (const provider of this.authProviders) {
+      const user = await provider.validateCredentials(email, password);
+      if (user) {
+        const access_token = this.generateAccessToken(user);
+        const refresh_token = this.generateRefreshToken(user);
+        await this.usersRepository.updateRefreshToken(user.id, refresh_token);
+        return {
+          access_token,
+          refresh_token,
+          user: {
+            id: user.id,
+            email: user.email,
+            name: user.name,
+          },
+        };
+      }
     }
 
-    // Verify password
-    const isPasswordValid = await bcrypt.compare(password, user.passwordHash);
-    if (!isPasswordValid) {
-      throw new UnauthorizedException('Invalid credentials');
-    }
-
-    // Generate tokens
-    const access_token = this.generateAccessToken(user);
-    const refresh_token = this.generateRefreshToken(user);
-
-    // Store refresh token
-    await this.usersRepository.updateRefreshToken(user.id, refresh_token);
-
-    return {
-      access_token,
-      refresh_token,
-      user: {
-        id: user.id,
-        email: user.email,
-        name: user.name,
-      },
-    };
+    throw new UnauthorizedException('Invalid credentials');
   }
 
   async refresh(refreshTokenDto: RefreshTokenDto) {
@@ -179,25 +180,23 @@ export class AuthService {
   async changePassword(userId: string, changePasswordDto: ChangePasswordDto) {
     const { old_password, new_password } = changePasswordDto;
 
-    // Get user with password
     const user = await this.usersRepository.findById(userId);
     if (!user) {
       throw new UnauthorizedException('User not found');
     }
 
-    // Verify old password
+    // AD 用戶無法在此修改密碼
+    if (user.passwordHash.startsWith('AD_')) {
+      throw new BadRequestException('AD users cannot change password here');
+    }
+
     const isPasswordValid = await bcrypt.compare(old_password, user.passwordHash);
     if (!isPasswordValid) {
       throw new BadRequestException('Current password is incorrect');
     }
 
-    // Hash new password
     const newPasswordHash = await bcrypt.hash(new_password, 10);
-
-    // Update password
     await this.usersRepository.updatePassword(userId, newPasswordHash);
-
-    // Revoke all refresh tokens for security
     await this.usersRepository.updateRefreshToken(userId, null);
 
     return { message: 'Password updated successfully' };
@@ -284,8 +283,7 @@ export class AuthService {
       type: 'refresh',
       jti: Math.random().toString(36).substring(2) + Date.now().toString(36), // 確保每次都不同
     };
-    return this.jwtService.sign(payload, {
-      expiresIn: '30d', // Refresh token 有效期 30 天
-    });
+    const expiresIn = (this.configService.get<string>('JWT_REFRESH_EXPIRES_IN') || '7d') as `${number}s` | `${number}m` | `${number}h` | `${number}d`;
+    return this.jwtService.sign(payload, { expiresIn });
   }
 }

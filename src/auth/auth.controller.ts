@@ -7,6 +7,8 @@ import {
   Query,
   UseGuards,
   Request,
+  NotFoundException,
+  BadRequestException,
 } from '@nestjs/common';
 import { AuthService } from './auth.service';
 import { RegisterDto } from './dto/register.dto';
@@ -51,7 +53,7 @@ export class AuthController {
   async getProfile(@Request() req) {
     const user = await this.usersService.findById(req.user.userId);
     if (!user) {
-      throw new Error('User not found');
+      throw new NotFoundException('User not found');
     }
     return {
       id: user.id,
@@ -65,13 +67,13 @@ export class AuthController {
   async getUserInfo(@Request() req) {
     const user = await this.usersService.findById(req.user.userId);
     if (!user) {
-      throw new Error('User not found');
+      throw new NotFoundException('User not found');
     }
     return {
       sub: user.id,
       email: user.email,
       name: user.name,
-      email_verified: true,
+      email_verified: user.emailVerified,
     };
   }
 
@@ -104,7 +106,7 @@ export class AuthController {
   @Get('verify-email')
   async verifyEmailGet(@Query('token') token: string) {
     if (!token) {
-      throw new Error('Token is required');
+      throw new BadRequestException('Token is required');
     }
     return this.authService.verifyEmail({ token });
   }
